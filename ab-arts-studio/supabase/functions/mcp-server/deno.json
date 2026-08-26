@@ -1,0 +1,9 @@
+{
+  "imports": {
+    "hono": "npm:hono@^4.6.0",
+    "mcp-lite": "npm:mcp-lite@^0.10.0",
+    "zod": "npm:zod@^3.23.8",
+    "zod-to-json-schema": "npm:zod-to-json-schema@^3.23.5",
+    "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.78.0"
+  }
+}
