@@ -1,62 +1,81 @@
 # ab-arts-studio
 
-Serveur MCP **distant**, en HTTP. Il tourne comme Edge Function Supabase dans le
-projet `tegxnwrdhgwvnbpukpar`, sous le nom `mcp-server`.
+Serveur MCP **distant**, en HTTP. Il tourne comme Edge Function Supabase sous le
+nom `mcp-server`, dans le projet **`lzffavvwaffkvwljuxyz`** (AB-Arts Studio).
 
-Le code source est desormais sauvegarde ici, dans
-[`supabase/functions/mcp-server/`](supabase/functions/mcp-server) :
+URL publique : **`https://ab-arts.studio/mcp`**, servie par un rewrite Vercel
+declare dans le `vercel.json` du depot principal.
+
+## Ou vit la source
+
+> **La source de verite est `D:\_GIT\abartsstudio-claude`**, pas ce dossier.
+>
+> Ce qui est ici est une **copie de sauvegarde** de ce qui est deploye. Modifier
+> ces fichiers ne change rien en production, et la copie ne se met pas a jour
+> toute seule. Toute modification passe par `abartsstudio-claude`, est deployee
+> depuis la-bas, puis recopiee ici.
 
 | Fichier | Role |
 |---|---|
-| `index.ts` | le serveur complet (441 lignes) : authentification, outils MCP, transport HTTP |
-| `deno.json` | la carte d'imports Deno (hono, mcp-lite, zod, supabase-js) |
+| `supabase/functions/mcp-server/index.ts` | le serveur : authentification, outils MCP, transport HTTP |
+| `supabase/functions/mcp-server/deno.json` | carte d'imports Deno (hono, mcp-lite, zod, supabase-js) |
+| `supabase/functions/_shared/model-catalog.generated.ts` | le catalogue des 47 modeles — **fichier genere, ne pas editer** |
 
-La fonction ne depend d'aucun fichier voisin : elle n'importe que des paquets
-distants, pas de `_shared/`. Ces deux fichiers suffisent a la redeployer.
+Depuis la version 1.2.0, la fonction **depend de `_shared/`** : le catalogue y
+est bundle au deploiement. Les deux fichiers de `mcp-server/` ne suffisent donc
+plus a la redeployer, contrairement a ce que disait la version precedente de ce
+README.
 
-## Ce que le serveur expose
+Le catalogue n'est pas ecrit a la main : `scripts/generate-model-catalog.mjs` le
+produit depuis les JSON de `src/config/models/`. On le regenere avec
+`npm run build:model-catalogue`, et `src/config/models/catalog.test.ts` echoue
+s'il n'est plus a jour.
 
-Serveur `ab-arts-studio`, version `1.1.0`, sept outils :
+## Ce que le serveur expose (v1.2.0, huit outils)
 
 | Outil | Role |
 |---|---|
-| `list_models` | catalogue des modeles disponibles |
+| `list_models` | les modeles, avec leurs parametres et leur nombre max d'images de reference |
+| `describe_model` | schema d'entree complet d'un modele : types, defauts, valeurs autorisees, bornes |
 | `get_token_balance` | solde de jetons du compte |
 | `list_recent_assets` | derniers assets generes |
 | `get_asset` | un asset par identifiant |
-| `wait_for_asset` | attente bloquante de fin de generation |
-| `generate_image` | generation d'image |
-| `generate_video` | generation de video |
+| `wait_for_asset` | attente bloquante de fin de generation (120 s max) |
+| `generate_image` | image — `reference_image_urls` (tableau) + `parameters` |
+| `generate_video` | video — slots start/last/video/audio + `parameters` |
+
+Les images de reference doivent etre des **URL HTTPS publiques** : une garde
+anti-SSRF refuse les IP privees, `localhost`, `.local` et `.internal`. Le nombre
+d'images accepte est plafonne par modele (14 pour nano-banana, 10 pour
+gpt-image-2, 0 pour seedream-v4-5 qui ne fait que du texte vers image).
 
 ## Authentification
 
 L'endpoint **exige une cle d'API AB-Arts**. Sans cle, il repond
-`-32001 Unauthorized`. Le serveur accepte la cle de trois facons, par ordre de
-preference :
+`-32001 Unauthorized`. Trois canaux acceptes, par ordre de preference :
 
-1. l'en-tete `X-API-Key` — **a privilegier**, car la passerelle Supabase
-   interprete `Authorization` comme un JWT et peut le consommer avant la fonction ;
+1. l'en-tete `X-API-Key` — **a privilegier**, la passerelle Supabase interprete
+   `Authorization` comme un JWT et peut le consommer avant la fonction ;
 2. l'en-tete `Authorization: Bearer <cle>` ;
 3. le parametre d'URL `?api_key=<cle>`, pour les clients incapables de poser un
    en-tete.
 
-La cle est verifiee cote base via la fonction `verify_api_key`, et chaque usage
-est trace dans `api_key_audit_log`.
+La cle est verifiee en base par `verify_api_key` et chaque usage est trace dans
+`api_key_audit_log`.
 
-## Configuration Claude Code
+**Piege connu** : une cle **revoquee** renvoie exactement le meme 401 qu'une cle
+absente ou invalide. Si l'authentification echoue sans raison apparente, verifier
+`revoked_at` dans `user_api_keys` avant de soupconner l'URL ou le canal.
 
-Le bloc ci-dessous remplace celui de l'ancienne version de ce README, qui
-n'indiquait que l'URL : **sans cle, cette configuration ne fonctionne pas.**
+## Configuration cote client
 
 ```json
 {
   "mcpServers": {
     "ab-arts-studio": {
       "type": "http",
-      "url": "https://tegxnwrdhgwvnbpukpar.supabase.co/functions/v1/mcp-server",
-      "headers": {
-        "X-API-Key": "<ta cle ab_arts_...>"
-      }
+      "url": "https://ab-arts.studio/mcp",
+      "headers": { "X-API-Key": "<ta cle ab_arts_...>" }
     }
   }
 }
@@ -65,21 +84,21 @@ n'indiquait que l'URL : **sans cle, cette configuration ne fonctionne pas.**
 Pour un client qui ne gere pas les en-tetes personnalises, passer par
 `mcp-remote` avec `--header Authorization:Bearer <cle>`.
 
-**Ne jamais commiter de cle dans ce depot.** Aucune cle n'est presente dans les
-fichiers sauvegardes ici.
+**L'ancien sous-domaine `mcp.ab-arts.studio` est mort** : son DNS resout encore,
+mais plus rien n'ecoute derriere. Une configuration qui le vise echoue sans
+message clair.
 
-## Variables d'environnement attendues cote Supabase
+**Ne jamais commiter de cle dans ce depot.** Aucune n'est presente ici.
+
+## Variables d'environnement cote Supabase
 
 | Variable | Fournie par |
 |---|---|
-| `SUPABASE_URL` | injectee automatiquement par la plateforme |
-| `SUPABASE_SERVICE_ROLE_KEY` | injectee automatiquement par la plateforme |
+| `SUPABASE_URL` | injectee par la plateforme |
+| `SUPABASE_SERVICE_ROLE_KEY` | injectee par la plateforme |
 | `APP_URL` | a definir dans les secrets du projet |
 
-## Configuration de deploiement
-
-Dans le `config.toml` du projet source, la fonction est declaree sans
-verification de JWT — l'authentification est faite par la fonction elle-meme :
+La fonction est declaree sans verification de JWT — elle authentifie elle-meme :
 
 ```toml
 [functions.mcp-server]
@@ -88,31 +107,25 @@ verification de JWT — l'authentification est faite par la fonction elle-meme :
 
 ## Redeployer
 
+Manuel : il n'y a **aucune CI** pour les edge functions, un `git push` ne deploie
+rien.
+
 ```bash
-supabase functions deploy mcp-server --project-ref tegxnwrdhgwvnbpukpar
+# depuis D:\_GIT\abartsstudio-claude, pas depuis ce dossier
+supabase functions deploy mcp-server --project-ref lzffavvwaffkvwljuxyz
 ```
 
-## Provenance de cette sauvegarde
+Lancer la commande depuis le depot principal est obligatoire : le deploiement
+embarque `_shared/model-catalog.generated.ts`, resolu relativement a ce depot.
 
-Le code n'a **pas** ete recupere avec
-`supabase functions download mcp-server --project-ref tegxnwrdhgwvnbpukpar` :
-cette commande renvoie `403 — Your account does not have the necessary
-privileges`, le compte Supabase connecte sur le poste n'ayant pas acces au
-projet `tegxnwrdhgwvnbpukpar`.
+## Note sur le projet Supabase
 
-Les fichiers proviennent donc du depot applicatif
-`AB-Arts/abartsstudio-claude`, chemin `supabase/functions/mcp-server/`, qui est
-la source de verite d'ou la fonction est deployee.
+La version precedente de ce README annonçait le projet `tegxnwrdhgwvnbpukpar`.
+**C'est faux.** Verifie le 2026-09-07 : ce projet ne repond plus du tout, tandis
+que `lzffavvwaffkvwljuxyz` sert bien la fonction. Le `config.toml`, le
+`.temp/project-ref`, le `.env.local` et le rewrite Vercel du depot principal
+pointent tous vers `lzffavvwaffkvwljuxyz`.
 
-**Consequence a connaitre :** cette copie n'a pas pu etre comparee a la version
-reellement en ligne. Si un correctif a un jour ete pousse directement depuis le
-tableau de bord Supabase sans repasser par le depot, il n'est pas ici. Pour
-lever ce doute, se connecter avec le compte proprietaire du projet
-(`supabase login`) puis relancer la commande `download` et comparer.
-
-Second point de vigilance : dans `abartsstudio-claude`, `supabase/config.toml`
-et `supabase/.temp/project-ref` pointent vers le projet
-`lzffavvwaffkvwljuxyz`, alors que le `.env` de l'application et l'URL du MCP
-pointent vers `tegxnwrdhgwvnbpukpar`. Un `supabase functions deploy` lance sans
-`--project-ref` explicite depuis ce depot deploierait donc **sur le mauvais
-projet**. Toujours passer `--project-ref tegxnwrdhgwvnbpukpar`.
+Seul le fichier `.env` du depot principal contient encore l'ancienne URL. Il
+n'est pas suivi par git et Vite donne la priorite a `.env.local`, donc
+l'application utilise bien le bon projet — mais c'est un vestige a nettoyer.

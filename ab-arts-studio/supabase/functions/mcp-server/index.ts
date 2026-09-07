@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
+import { getCatalogModel, listCatalogModels, type CatalogModel } from '../_shared/model-catalog.generated.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SERVICE_ROLE = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -146,26 +147,182 @@ function withAudit<TArgs, TRes>(toolName: string, fn: (args: TArgs, ctx: UserCtx
   };
 }
 
+
+// =========================
+// Catalogue-driven request building
+// =========================
+
+// The React app derives these from the model JSON and sends them with every
+// request; generate-content relies on them to resolve the provider model and to
+// map parameters. Reading them from the generated catalogue instead means an MCP
+// caller reaches every model the app reaches, with every advanced parameter —
+// and that the values come from the catalogue rather than from the caller.
+function generationEnvelope(m: CatalogModel) {
+  return {
+    ...(m.apiModel && { apiModel: m.apiModel }),
+    provider: m.provider,
+    supportsOutputQuality: m.supportsOutputQuality,
+    supportsMultiOutput: m.supportsMultiOutput,
+    defaultOutputFormat: m.defaultOutputFormat,
+  };
+}
+
+function catalogueOptions(m: CatalogModel) {
+  return {
+    ...(m.apiMapping && { _apiMapping: m.apiMapping }),
+    ...(m.parameterKeys.length > 0 && { _parameterKeys: m.parameterKeys }),
+  };
+}
+
+function requireModel(id: string, expectedType: string): CatalogModel {
+  const m = getCatalogModel(id);
+  if (!m) {
+    const near = listCatalogModels(expectedType).map((x) => x.id).slice(0, 40).join(", ");
+    throw new Error(`Invalid model: \"${id}\" is not available. Try list_models. Known ${expectedType} models: ${near}`);
+  }
+  if (m.type !== expectedType) {
+    throw new Error(`Invalid model: \"${id}\" is a ${m.type} model, not ${expectedType}`);
+  }
+  return m;
+}
+
+// Validates caller-supplied advanced parameters against the catalogue and returns
+// them keyed the way generate-content expects (options[param.key]).
+// Anything not declared by the model is rejected rather than forwarded: the
+// catalogue is the allow-list, so a caller cannot smuggle an arbitrary field
+// through to the provider.
+function validateParameters(m: CatalogModel, raw: unknown): Record<string, unknown> {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Invalid parameters: expected an object of key/value pairs");
+  }
+  const declared = [...m.parameters.basic, ...m.parameters.advanced];
+  const out: Record<string, unknown> = {};
+
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (value === undefined || value === null) continue;
+    // Accept either the internal key or the provider parameter name, because a
+    // caller reading the provider docs will naturally reach for the latter.
+    const spec = declared.find((d) => d.key === name || d.apiParam === name);
+    if (!spec) {
+      const allowed = declared.map((d) => d.apiParam ?? d.key).join(", ");
+      throw new Error(`Invalid parameter \"${name}\" for ${m.id}. Accepted: ${allowed || "none"}`);
+    }
+
+    if (spec.type === "select" && Array.isArray(spec.options) && !spec.options.includes(value as never)) {
+      throw new Error(`Invalid value for \"${name}\": expected one of ${spec.options.join(", ")}`);
+    }
+    if (spec.type === "slider" || spec.type === "number") {
+      const n = Number(value);
+      if (!Number.isFinite(n)) throw new Error(`Invalid value for \"${name}\": expected a number`);
+      if (typeof spec.min === "number" && n < spec.min) throw new Error(`Invalid value for \"${name}\": minimum is ${spec.min}`);
+      if (typeof spec.max === "number" && n > spec.max) throw new Error(`Invalid value for \"${name}\": maximum is ${spec.max}`);
+      out[spec.key] = n;
+      continue;
+    }
+    if (spec.type === "toggle" || spec.type === "boolean") {
+      out[spec.key] = value === true || value === "true";
+      continue;
+    }
+    out[spec.key] = value;
+  }
+  return out;
+}
+
+// Normalises the reference-image input. Accepts the historical singular field so
+// existing client setups keep working, caps the list at what the model actually
+// takes, and runs every URL through the SSRF guard.
+function collectReferenceImages(m: CatalogModel, args: any): string[] {
+  const raw: unknown[] = Array.isArray(args?.reference_image_urls)
+    ? args.reference_image_urls
+    : args?.reference_image_url
+      ? [args.reference_image_url]
+      : [];
+  if (raw.length === 0) return [];
+
+  const max = Number(m.capabilities?.maxReferenceImages ?? 0);
+  if (!m.capabilities?.supportsReferenceImage || max < 1) {
+    throw new Error(`Invalid reference_image_urls: ${m.id} does not accept reference images`);
+  }
+  const urls = raw.map((u) => String(u));
+  if (urls.length > max) {
+    throw new Error(`Invalid reference_image_urls: ${m.id} accepts at most ${max} (got ${urls.length})`);
+  }
+  urls.forEach((u, i) => assertPublicHttpsUrl(u, `reference_image_urls[${i}]`));
+  return urls;
+}
+
 // =========================
 // MCP Server
 // =========================
 const mcp = new McpServer({
   name: 'ab-arts-studio',
-  version: '1.1.0',
+  version: '1.2.0',
   schemaAdapter: (schema) => zodToJsonSchema(schema as z.ZodType) as Record<string, unknown>,
 });
 
 mcp.tool('list_models', {
-  description: 'List all available AI models on AB-Arts Studio. Returns id, name, category, provider, pricing.',
+  description:
+    'List available models: id, name, type, provider, category, how many reference images each takes, and its parameter names. Call describe_model for the full schema of a given model.',
   inputSchema: z.object({
-    category: z.enum(['image', 'video', 'llm', 'upscale', 'all']).optional(),
+    category: z
+      .enum(['image', 'video', 'audio', 'llm', 'upscale', 'vectorize', '3d', 'avatar', 'all'])
+      .optional(),
   }),
   handler: withAudit('list_models', async ({ category }: { category?: string }) => {
-    let query = service.from('pricing_models').select('model_id, model_name, category, provider, api_cost_eur, pricing_type');
-    if (category && category !== 'all') query = query.eq('category', category);
-    const { data, error } = await query.order('category').order('model_name');
-    if (error) throw new Error('Bad request: query failed');
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    // Served from the generated catalogue rather than pricing_models. That table
+    // only holds what an admin last synced and carries no parameter schema, so it
+    // used to advertise models generate_image could not actually run.
+    const rows = listCatalogModels(category).map((m) => ({
+      id: m.id,
+      name: m.name,
+      type: m.type,
+      provider: m.provider,
+      category: m.category,
+      description: m.description,
+      max_reference_images: m.capabilities?.supportsReferenceImage
+        ? (m.capabilities?.maxReferenceImages ?? 0)
+        : 0,
+      parameters: [...m.parameters.basic, ...m.parameters.advanced].map(
+        (x) => x.apiParam ?? x.key,
+      ),
+    }));
+    return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+  }),
+});
+
+mcp.tool('describe_model', {
+  description:
+    'Full input schema for one model: every parameter with type, default, allowed values and bounds, plus reference-image and duration limits. Call this before generate_image or generate_video.',
+  inputSchema: z.object({ model: z.string() }),
+  handler: withAudit('describe_model', async ({ model }: { model: string }) => {
+    const m = getCatalogModel(String(model ?? '').trim());
+    if (!m) throw new Error(`Invalid model: '${model}' is not available. Try list_models.`);
+    const supportsRefs = m.capabilities?.supportsReferenceImage === true;
+    const shape = {
+      id: m.id,
+      name: m.name,
+      type: m.type,
+      provider: m.provider,
+      description: m.description,
+      reference_images: {
+        supported: supportsRefs,
+        max: supportsRefs ? (m.capabilities?.maxReferenceImages ?? 0) : 0,
+        field: 'reference_image_urls',
+      },
+      ...(m.duration && { duration: m.duration }),
+      parameters: [...m.parameters.basic, ...m.parameters.advanced].map((x) => ({
+        name: x.apiParam ?? x.key,
+        type: x.type,
+        ...(x.default !== undefined && { default: x.default }),
+        ...(x.options && { allowed_values: x.options }),
+        ...(x.min !== undefined && { min: x.min }),
+        ...(x.max !== undefined && { max: x.max }),
+        ...(x.label && { label: x.label }),
+        ...(x.tooltip && { note: x.tooltip }),
+      })),
+    };
+    return { content: [{ type: 'text', text: JSON.stringify(shape, null, 2) }] };
   }),
 });
 
@@ -300,91 +457,169 @@ async function invokeGenerate(body: Record<string, unknown>) {
 }
 
 mcp.tool('generate_image', {
-  description: 'Generate an image. Returns asset_id immediately; poll with wait_for_asset.',
+  description:
+    'Generate an image. Advanced options go in `parameters` — call describe_model first to see what the model accepts. Returns asset_id immediately; poll with wait_for_asset.',
   inputSchema: z.object({
     prompt: z.string(),
     model: z.string(),
     aspect_ratio: z.string().optional(),
+    reference_image_urls: z.array(z.string()).optional(),
     reference_image_url: z.string().optional(),
+    parameters: z.record(z.unknown()).optional(),
   }),
   handler: withAudit('generate_image', async (args: any, ctx) => {
     const prompt = String(args?.prompt ?? '').trim();
-    const model = String(args?.model ?? '').trim();
+    const modelId = String(args?.model ?? '').trim();
     if (!prompt) throw new Error('Bad request: prompt required');
-    if (!model) throw new Error('Bad request: model required');
+    if (!modelId) throw new Error('Bad request: model required');
     if (prompt.length > 4000) throw new Error('Bad request: prompt too long');
-    if (args?.reference_image_url) assertPublicHttpsUrl(String(args.reference_image_url), 'reference_image_url');
+
+    const m = requireModel(modelId, 'image');
+    const refs = collectReferenceImages(m, args);
+    const params = validateParameters(m, args?.parameters);
     const aspect = args?.aspect_ratio ? String(args.aspect_ratio).slice(0, 16) : undefined;
 
     const data = await invokeGenerate({
       _pipelineUserId: ctx.userId,
       prompt,
       type: 'image',
-      model,
+      model: m.id,
+      ...generationEnvelope(m),
       ...(ctx.workspaceId && { workspace_id: ctx.workspaceId }),
       options: {
+        ...catalogueOptions(m),
+        ...params,
         ...(aspect && { aspectRatio: aspect }),
-        ...(args.reference_image_url && {
-          referenceImage: args.reference_image_url,
-          refImage: args.reference_image_url,
+        // refImages drives the multi-reference path; the singular fields stay for
+        // the model branches in generate-content that still read them.
+        ...(refs.length > 0 && {
+          refImages: refs,
+          referenceImage: refs[0],
+          refImage: refs[0],
         }),
         via: 'mcp',
       },
     });
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          asset_id: data.assetId,
-          status: data.status,
-          message: 'Use wait_for_asset to poll, or get_asset with include_image=true to view it.',
-        }, null, 2),
-      }],
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              asset_id: data.assetId,
+              status: data.status,
+              model: m.id,
+              reference_images: refs.length,
+              applied_parameters: params,
+              message:
+                'Use wait_for_asset to poll, or get_asset with include_image=true to view it.',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
     };
   }),
 });
 
 mcp.tool('generate_video', {
-  description: 'Generate a video. Returns asset_id immediately; poll with wait_for_asset.',
+  description:
+    'Generate a video. Advanced options go in `parameters` — call describe_model first. Returns asset_id immediately; poll with wait_for_asset.',
   inputSchema: z.object({
     prompt: z.string(),
     model: z.string(),
-    start_image_url: z.string().optional(),
-    duration_seconds: z.number().optional(),
     aspect_ratio: z.string().optional(),
+    duration_seconds: z.number().optional(),
+    start_image_url: z.string().optional(),
+    last_image_url: z.string().optional(),
+    reference_image_urls: z.array(z.string()).optional(),
+    reference_image_url: z.string().optional(),
+    video_reference_url: z.string().optional(),
+    audio_reference_url: z.string().optional(),
+    parameters: z.record(z.unknown()).optional(),
   }),
   handler: withAudit('generate_video', async (args: any, ctx) => {
     const prompt = String(args?.prompt ?? '').trim();
-    const model = String(args?.model ?? '').trim();
+    const modelId = String(args?.model ?? '').trim();
     if (!prompt) throw new Error('Bad request: prompt required');
-    if (!model) throw new Error('Bad request: model required');
+    if (!modelId) throw new Error('Bad request: model required');
     if (prompt.length > 4000) throw new Error('Bad request: prompt too long');
-    if (args?.start_image_url) assertPublicHttpsUrl(String(args.start_image_url), 'start_image_url');
+
+    const m = requireModel(modelId, 'video');
+    const refs = collectReferenceImages(m, args);
+    const params = validateParameters(m, args?.parameters);
+
+    const urlFields: Array<[string, unknown]> = [
+      ['start_image_url', args?.start_image_url],
+      ['last_image_url', args?.last_image_url],
+      ['video_reference_url', args?.video_reference_url],
+      ['audio_reference_url', args?.audio_reference_url],
+    ];
+    for (const [field, val] of urlFields) {
+      if (val) assertPublicHttpsUrl(String(val), field);
+    }
+
     const aspect = args?.aspect_ratio ? String(args.aspect_ratio).slice(0, 16) : undefined;
-    const dur = args?.duration_seconds ? Math.min(Math.max(Number(args.duration_seconds), 1), 60) : undefined;
+
+    // Clamp against what this model declares rather than a blanket 1-60.
+    let dur: number | undefined;
+    if (args?.duration_seconds !== undefined) {
+      const d = Number(args.duration_seconds);
+      const spec = m.duration as Record<string, unknown> | undefined;
+      const allowed = spec?.allowedDurations as number[] | undefined;
+      if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(d)) {
+        throw new Error(
+          `Invalid duration_seconds for ${m.id}: allowed values are ${allowed.join(', ')}`,
+        );
+      }
+      const lo = Number(spec?.minDuration ?? 1);
+      const hi = Number(spec?.maxDuration ?? 60);
+      dur = Math.min(Math.max(d, lo), hi);
+    }
 
     const data = await invokeGenerate({
       _pipelineUserId: ctx.userId,
       prompt,
       type: 'video',
-      model,
+      model: m.id,
+      ...generationEnvelope(m),
       ...(ctx.workspaceId && { workspace_id: ctx.workspaceId }),
       options: {
-        ...(args.start_image_url && { startImage: args.start_image_url, referenceImage: args.start_image_url }),
-        ...(dur && { duration: dur }),
+        ...catalogueOptions(m),
+        ...params,
         ...(aspect && { aspectRatio: aspect }),
+        ...(dur !== undefined && { duration: dur }),
+        ...(args.start_image_url && {
+          startImage: args.start_image_url,
+          referenceImage: args.start_image_url,
+        }),
+        ...(args.last_image_url && { lastImage: args.last_image_url }),
+        ...(args.video_reference_url && { videoRef: args.video_reference_url }),
+        ...(args.audio_reference_url && { audioRef: args.audio_reference_url }),
+        ...(refs.length > 0 && { refImages: refs }),
         via: 'mcp',
       },
     });
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          asset_id: data.assetId,
-          status: data.status,
-          message: 'Video generation started. Use wait_for_asset (max 120s) · call repeatedly if needed.',
-        }, null, 2),
-      }],
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              asset_id: data.assetId,
+              status: data.status,
+              model: m.id,
+              reference_images: refs.length,
+              applied_parameters: params,
+              message:
+                'Video generation started. Use wait_for_asset (max 120s) · call repeatedly if needed.',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
     };
   }),
 });
