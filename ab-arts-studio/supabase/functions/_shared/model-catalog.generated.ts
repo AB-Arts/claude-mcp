@@ -3334,6 +3334,85 @@ export const MODEL_CATALOG: CatalogModel[] = [
     ]
   },
   {
+    "id": "kling-avatar-v2",
+    "name": "Kling Avatar V2",
+    "type": "video",
+    "provider": "replicate",
+    "category": "Specialized",
+    "description": "Audio-driven talking avatar: portrait + your own speech audio -> lip-synced video up to 1080p / 48 fps. Length follows the audio.",
+    "apiModel": "kwaivgi/kling-avatar-v2",
+    "defaultOutputFormat": "mp4",
+    "supportsOutputQuality": true,
+    "supportsMultiOutput": false,
+    "apiMapping": {
+      "referenceImage": "image",
+      "audioFile": "audio",
+      "slots": {
+        "startImage": "image"
+      }
+    },
+    "capabilities": {
+      "maxResolution": "1080p",
+      "resolutionBehavior": "input-based",
+      "supportsReferenceImage": false,
+      "requiresReferenceImage": true,
+      "supportsAdvancedOptions": true,
+      "requiresAudio": true,
+      "requiresPrompt": false,
+      "supportsAspectRatioWithStartImage": false
+    },
+    "duration": {
+      "behavior": "audio-based",
+      "maxDuration": 300,
+      "sendToApi": false
+    },
+    "pricing": {
+      "apiCostEur": 0.1012,
+      "pricingType": "per_second",
+      "baseDuration": 1,
+      "useVariantPricing": true,
+      "variants": [
+        {
+          "condition": {
+            "mode": "std"
+          },
+          "apiCostEur": 0.0515
+        },
+        {
+          "condition": {
+            "mode": "pro"
+          },
+          "apiCostEur": 0.1012
+        }
+      ]
+    },
+    "parameters": {
+      "basic": [],
+      "advanced": [
+        {
+          "key": "klingAvatarMode",
+          "apiParam": "mode",
+          "type": "select",
+          "default": "pro",
+          "options": [
+            "std",
+            "pro"
+          ],
+          "label": "Quality Mode",
+          "tooltip": "std: cheaper. pro: better facial detail and smoother motion."
+        }
+      ],
+      "images": []
+    },
+    "parameterKeys": [
+      {
+        "key": "klingAvatarMode",
+        "apiParam": "mode",
+        "default": "pro"
+      }
+    ]
+  },
+  {
     "id": "kling-v2.1",
     "name": "Kling v2.1",
     "type": "video",
