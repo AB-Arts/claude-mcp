@@ -2283,18 +2283,17 @@ export const MODEL_CATALOG: CatalogModel[] = [
     "id": "seedream-4-edit",
     "name": "SeeDream 4 Edit",
     "type": "image",
-    "provider": "fal-ai",
+    "provider": "replicate",
     "category": "Image Editing",
     "description": "Advanced multi-image editing. Combine, transform, and edit up to 10 images with a single prompt. Ideal for complex scene compositions.",
-    "apiModel": "fal-ai/bytedance/seedream/v4/edit",
+    "apiModel": "bytedance/seedream-4",
     "defaultOutputFormat": "png",
-    "supportsOutputQuality": true,
+    "supportsOutputQuality": false,
     "supportsMultiOutput": false,
     "apiMapping": {
       "slots": {
-        "refImage": "image_urls"
-      },
-      "customMappings": {}
+        "refImage": "image_input"
+      }
     },
     "capabilities": {
       "maxResolution": "4k",
@@ -2316,7 +2315,6 @@ export const MODEL_CATALOG: CatalogModel[] = [
       "advanced": [
         {
           "key": "seedreamImageSize",
-          "apiParam": "image_size",
           "type": "select",
           "default": "auto",
           "options": [
@@ -2335,7 +2333,6 @@ export const MODEL_CATALOG: CatalogModel[] = [
         },
         {
           "key": "seedreamEnhanceMode",
-          "apiParam": "enhance_prompt_mode",
           "type": "select",
           "default": "standard",
           "options": [
@@ -2344,33 +2341,12 @@ export const MODEL_CATALOG: CatalogModel[] = [
           ],
           "label": "Enhance Mode",
           "tooltip": "Standard = higher quality, Fast = quicker results"
-        },
-        {
-          "key": "seedreamNumImages",
-          "apiParam": "num_images",
-          "type": "slider",
-          "default": 1,
-          "min": 1,
-          "max": 4,
-          "label": "Number of Outputs"
-        },
-        {
-          "key": "seedreamSeed",
-          "apiParam": "seed",
-          "type": "seed"
-        },
-        {
-          "key": "seedreamSafetyChecker",
-          "apiParam": "enable_safety_checker",
-          "type": "switch",
-          "default": true,
-          "label": "Safety Checker"
         }
       ],
       "images": [
         {
           "key": "seedreamInputImages",
-          "apiParam": "image_urls",
+          "apiParam": "image_input",
           "label": "Input Images",
           "max": 10
         }
@@ -2379,27 +2355,11 @@ export const MODEL_CATALOG: CatalogModel[] = [
     "parameterKeys": [
       {
         "key": "seedreamImageSize",
-        "apiParam": "image_size",
         "default": "auto"
       },
       {
         "key": "seedreamEnhanceMode",
-        "apiParam": "enhance_prompt_mode",
         "default": "standard"
-      },
-      {
-        "key": "seedreamNumImages",
-        "apiParam": "num_images",
-        "default": 1
-      },
-      {
-        "key": "seedreamSeed",
-        "apiParam": "seed"
-      },
-      {
-        "key": "seedreamSafetyChecker",
-        "apiParam": "enable_safety_checker",
-        "default": true
       }
     ]
   },
@@ -2551,23 +2511,14 @@ export const MODEL_CATALOG: CatalogModel[] = [
     "id": "seedream-v4-5",
     "name": "Seedream v4.5",
     "type": "image",
-    "provider": "fal-ai",
+    "provider": "replicate",
     "category": "Fast & Efficient",
     "description": "Fast text-to-image generation with high quality. Supports up to 4K resolution. Ideal for rapid creative iterations.",
-    "apiModel": "fal-ai/bytedance/seedream/v4.5/text-to-image",
+    "apiModel": "bytedance/seedream-4.5",
     "defaultOutputFormat": "png",
-    "supportsOutputQuality": true,
+    "supportsOutputQuality": false,
     "supportsMultiOutput": false,
-    "apiMapping": {
-      "aspectRatio": "image_size",
-      "customMappings": {
-        "resolutionTierToImageSize": {
-          "1K": "square",
-          "2K": "auto_2K",
-          "4K": "auto_4K"
-        }
-      }
-    },
+    "apiMapping": null,
     "capabilities": {
       "minResolution": "2k",
       "maxResolution": "4k",
@@ -2588,7 +2539,6 @@ export const MODEL_CATALOG: CatalogModel[] = [
       "advanced": [
         {
           "key": "seedreamV45ImageSize",
-          "apiParam": "image_size",
           "type": "select",
           "default": "auto_2K",
           "options": [
@@ -2604,23 +2554,7 @@ export const MODEL_CATALOG: CatalogModel[] = [
           "label": "Image Size"
         },
         {
-          "key": "seedreamV45NumImages",
-          "apiParam": "num_images",
-          "type": "slider",
-          "default": 1,
-          "min": 1,
-          "max": 4,
-          "label": "Number of Images"
-        },
-        {
-          "key": "seedreamV45Seed",
-          "apiParam": "seed",
-          "type": "seed",
-          "label": "Seed"
-        },
-        {
           "key": "seedreamV45SafetyChecker",
-          "apiParam": "enable_safety_checker",
           "type": "switch",
           "default": true,
           "label": "Safety Checker"
@@ -2631,21 +2565,10 @@ export const MODEL_CATALOG: CatalogModel[] = [
     "parameterKeys": [
       {
         "key": "seedreamV45ImageSize",
-        "apiParam": "image_size",
         "default": "auto_2K"
       },
       {
-        "key": "seedreamV45NumImages",
-        "apiParam": "num_images",
-        "default": 1
-      },
-      {
-        "key": "seedreamV45Seed",
-        "apiParam": "seed"
-      },
-      {
         "key": "seedreamV45SafetyChecker",
-        "apiParam": "enable_safety_checker",
         "default": true
       }
     ]

@@ -20,6 +20,8 @@ declare dans le `vercel.json` du depot principal.
 | `supabase/functions/mcp-server/index.ts` | le serveur : authentification, outils MCP, transport HTTP |
 | `supabase/functions/mcp-server/deno.json` | carte d'imports Deno (hono, mcp-lite, zod, supabase-js) |
 | `supabase/functions/_shared/model-catalog.generated.ts` | le catalogue des 47 modeles — **fichier genere, ne pas editer** |
+| `supabase/functions/_shared/media-url.ts` | detecte les URL d'entree sans extension de fichier (liens Google Drive, etc.) |
+| `supabase/functions/_shared/r2-storage.ts` | ecriture dans le stockage R2 du studio (recopie de ces entrees) |
 
 Depuis la version 1.2.0, la fonction **depend de `_shared/`** : le catalogue y
 est bundle au deploiement. Les deux fichiers de `mcp-server/` ne suffisent donc
@@ -104,6 +106,13 @@ La fonction est declaree sans verification de JWT — elle authentifie elle-meme
 [functions.mcp-server]
   verify_jwt = false
 ```
+
+## Historique des corrections
+
+**2026-11-11 — `generate_video` avec OmniHuman 1.5 et des liens Google Drive** (branche `fix/omni-human-mcp-audio` de `abartsstudio-claude`)
+
+- `mcp-server` (commit `42b2aa02`, deploye) : une URL d'entree dont le chemin n'a pas d'extension media (ex. `drive.usercontent.google.com/download?id=...`) est telechargee puis recopiee dans `uploaded-media/<user>/mcp-inputs/<uuid>.<ext>` du R2 du studio, l'extension etant deduite du `Content-Type`. Sans ca, Replicate enregistrait le fichier sous `/tmp/...download` et OmniHuman echouait ("Failed to upload"). Une reponse qui n'est pas un media (page de connexion Drive) renvoie un message clair.
+- `generate-content` (commit `9db09d1a`, deploye) : l'audio transmis par le MCP (`audio_reference_url` -> `options.audioRef`) n'etait pas lu par la branche OmniHuman, d'ou un `422 audio is required`. Cette fonction n'est **pas** sauvegardee ici : la correction vit dans `abartsstudio-claude` (`_shared/omni-human-input.ts`).
 
 ## Redeployer
 

@@ -5,6 +5,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { getCatalogModel, listCatalogModels, type CatalogModel } from '../_shared/model-catalog.generated.ts';
+import { fetchPricingConfig } from '../_shared/pricing-service.ts';
+import { deductTokens, refundTokens } from '../_shared/workspace-tokens.ts';
+import { extensionForContentType, urlHasMediaExtension } from '../_shared/media-url.ts';
+import { uploadToR2 } from '../_shared/r2-storage.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SERVICE_ROLE = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -229,6 +233,39 @@ function validateParameters(m: CatalogModel, raw: unknown): Record<string, unkno
   return out;
 }
 
+// Providers (Replicate) name a downloaded input after the URL's last path
+// segment; without a file extension (Google Drive links, signed URLs, …) models
+// like OmniHuman cannot detect the media type and fail. Mirror such inputs into
+// the studio's own storage under a real extension. URLs that already end in a
+// media extension are passed through untouched.
+const MIRROR_MAX_BYTES = 100 * 1024 * 1024;
+
+async function withMediaExtension(url: string, field: string, userId: string): Promise<string> {
+  if (urlHasMediaExtension(url)) return url;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const res = await fetch(url, { redirect: 'follow', signal: controller.signal });
+    if (!res.ok) throw new Error(`Invalid ${field}: download failed (HTTP ${res.status})`);
+    const contentType = res.headers.get('content-type');
+    const ext = extensionForContentType(contentType);
+    if (!ext) {
+      throw new Error(
+        `Invalid ${field}: the link does not return a media file (got ${contentType ?? 'no content-type'}). ` +
+          'Make sure it is publicly downloadable, e.g. a Google Drive file shared with "anyone with the link".',
+      );
+    }
+    const declared = Number(res.headers.get('content-length') ?? 0);
+    if (declared > MIRROR_MAX_BYTES) throw new Error(`Invalid ${field}: file larger than 100 MB`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.byteLength > MIRROR_MAX_BYTES) throw new Error(`Invalid ${field}: file larger than 100 MB`);
+    const key = `uploaded-media/${userId}/mcp-inputs/${crypto.randomUUID()}.${ext}`;
+    return await uploadToR2(key, bytes, contentType!.split(';')[0].trim());
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // Normalises the reference-image input. Accepts the historical singular field so
 // existing client setups keep working, caps the list at what the model actually
 // takes, and runs every URL through the SSRF guard.
@@ -257,7 +294,7 @@ function collectReferenceImages(m: CatalogModel, args: any): string[] {
 // =========================
 const mcp = new McpServer({
   name: 'ab-arts-studio',
-  version: '1.2.0',
+  version: '1.3.0',
   schemaAdapter: (schema) => zodToJsonSchema(schema as z.ZodType) as Record<string, unknown>,
 });
 
@@ -475,7 +512,11 @@ mcp.tool('generate_image', {
     if (prompt.length > 4000) throw new Error('Bad request: prompt too long');
 
     const m = requireModel(modelId, 'image');
-    const refs = collectReferenceImages(m, args);
+    const refs = await Promise.all(
+      collectReferenceImages(m, args).map((u, i) =>
+        withMediaExtension(u, `reference_image_urls[${i}]`, ctx.userId),
+      ),
+    );
     const params = validateParameters(m, args?.parameters);
     const aspect = args?.aspect_ratio ? String(args.aspect_ratio).slice(0, 16) : undefined;
 
@@ -559,6 +600,13 @@ mcp.tool('generate_video', {
     for (const [field, val] of urlFields) {
       if (val) assertPublicHttpsUrl(String(val), field);
     }
+    // Mirror extension-less inputs (e.g. Google Drive links) — see withMediaExtension.
+    for (const [field] of urlFields) {
+      if (args?.[field]) args[field] = await withMediaExtension(String(args[field]), field, ctx.userId);
+    }
+    for (let i = 0; i < refs.length; i++) {
+      refs[i] = await withMediaExtension(refs[i], `reference_image_urls[${i}]`, ctx.userId);
+    }
 
     const aspect = args?.aspect_ratio ? String(args.aspect_ratio).slice(0, 16) : undefined;
 
@@ -614,6 +662,448 @@ mcp.tool('generate_video', {
               applied_parameters: params,
               message:
                 'Video generation started. Use wait_for_asset (max 120s) · call repeatedly if needed.',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }),
+});
+
+// =========================
+// Upscale (Topaz) — billed here, not in upscale-*-async
+// =========================
+// The upscale-*-async edge functions authenticate with a user JWT, which an MCP
+// caller never has: it presents an ab_arts_ key that resolves to ctx.userId. So
+// the same pipeline runs here on the service-role client — price from the
+// catalogue, deduct, create the asset row, submit to Replicate, then hand the
+// job over to check-generation-status.
+
+// Upscale models come in two incompatible shapes (a video one and an image one)
+// and the catalogue types them both as 'upscale', so each tool names the ids it
+// accepts rather than guessing from the parameter list.
+const UPSCALE_VIDEO_MODELS = new Set(['topaz-video-upscaler']);
+const UPSCALE_IMAGE_MODELS = new Set(['topaz-upscaler']);
+const MAX_UPSCALE_DURATION_SECONDS = 600;
+const TOKEN_PRICE_EUR = 0.01;
+
+function requireUpscaleModel(id: string, kind: 'video' | 'image'): CatalogModel {
+  const m = requireModel(id, 'upscale');
+  const allowed = kind === 'video' ? UPSCALE_VIDEO_MODELS : UPSCALE_IMAGE_MODELS;
+  if (!allowed.has(m.id)) {
+    throw new Error(
+      `Invalid model: "${m.id}" is not a ${kind} upscaler. Accepted: ${[...allowed].join(', ')}`,
+    );
+  }
+  return m;
+}
+
+// Per-variant API cost, read from the model JSON. The same numbers the app's
+// variant table holds, minus the second copy that can drift out of step.
+function variantApiCost(m: CatalogModel, condition: Record<string, string | number>): number {
+  const variants = (m.pricing?.variants ?? []) as Array<{
+    apiCostEur?: number;
+    condition?: Record<string, unknown>;
+  }>;
+  const hit = variants.find((v) =>
+    Object.entries(condition).every(([k, want]) => String(v.condition?.[k]) === String(want)),
+  );
+  const cost = Number(hit?.apiCostEur ?? m.pricing?.apiCostEur);
+  if (!Number.isFinite(cost) || cost <= 0) {
+    throw new Error(`Bad request: no price configured for ${m.id} ${JSON.stringify(condition)}`);
+  }
+  return cost;
+}
+
+async function upscaleMarginPercent(): Promise<number> {
+  const pricing = await fetchPricingConfig(SUPABASE_URL, SERVICE_ROLE);
+  const margin = Number(pricing.margins['upscale'] ?? pricing.margins['video'] ?? 300);
+  return Number.isFinite(margin) ? margin : 300;
+}
+
+function tokensFor(apiCostEur: number, marginPercent: number): number {
+  // Round off the binary dust before the ceiling: 0.025 * 6 lands on
+  // 0.15000000000000002, which would bill one token more than the price asks.
+  const tokens = (apiCostEur * (1 + marginPercent / 100)) / TOKEN_PRICE_EUR;
+  return Math.ceil(Number(tokens.toFixed(6)));
+}
+
+// Reads one of the caller's own assets. Doubles as the ownership check that lets
+// us trust its stored duration and file_url.
+async function ownedAsset(assetId: string, ctx: UserCtx, acceptedTypes: string[]) {
+  const { data, error } = await service
+    .from('assets')
+    .select('id, type, status, file_url, prompt, original_prompt, metadata')
+    .eq('id', assetId)
+    .eq('user_id', ctx.userId)
+    .maybeSingle();
+  if (error) throw new Error('Bad request: query failed');
+  if (!data) throw new Error('Asset not found');
+  if (!acceptedTypes.includes(data.type)) {
+    throw new Error(
+      `Invalid source_asset_id: asset ${data.id} is a ${data.type}, expected ${acceptedTypes.join(' or ')}`,
+    );
+  }
+  if (!data.file_url) throw new Error(`Invalid source_asset_id: asset ${data.id} has no file yet`);
+  return data;
+}
+
+// The duration drives the bill, so prefer the one we stored ourselves when the
+// caller names a source asset, and only fall back to the declared value — bounded,
+// whole seconds, rounded up — for an external URL. A declared value that
+// contradicts the stored one is rejected rather than quietly overridden.
+function resolveUpscaleDuration(
+  declared: unknown,
+  storedRaw: unknown,
+): { seconds: number; source: 'source_asset' | 'declared' } {
+  const stored = Number(storedRaw);
+  const hasStored = Number.isFinite(stored) && stored > 0;
+  const hasDeclared = declared !== undefined && declared !== null;
+  const d = hasDeclared ? Number(declared) : NaN;
+
+  if (hasDeclared && (!Number.isFinite(d) || d <= 0)) {
+    throw new Error('Invalid duration_seconds: expected a positive number of seconds');
+  }
+
+  if (hasStored) {
+    if (hasDeclared && Math.abs(d - stored) / stored > 0.1) {
+      throw new Error(
+        `Invalid duration_seconds: the source asset is ${stored}s, not ${d}s. Omit duration_seconds to bill on the stored duration.`,
+      );
+    }
+    if (stored > MAX_UPSCALE_DURATION_SECONDS) {
+      throw new Error(
+        `Invalid duration_seconds: ${stored}s exceeds the ${MAX_UPSCALE_DURATION_SECONDS}s limit. Cut the clip first.`,
+      );
+    }
+    return { seconds: Math.ceil(stored), source: 'source_asset' };
+  }
+
+  if (!hasDeclared) {
+    throw new Error(
+      'Bad request: duration_seconds required (or pass a source_asset_id whose duration we hold)',
+    );
+  }
+  if (d > MAX_UPSCALE_DURATION_SECONDS) {
+    throw new Error(
+      `Invalid duration_seconds: maximum is ${MAX_UPSCALE_DURATION_SECONDS}s. Cut the clip first.`,
+    );
+  }
+  return { seconds: Math.ceil(d), source: 'declared' };
+}
+
+async function submitReplicate(apiModel: string, input: Record<string, unknown>): Promise<string> {
+  const key = Deno.env.get('REPLICATE_API_KEY');
+  if (!key) throw new Error('Bad request: upscale service not configured');
+  // Ask Replicate to call us back when the prediction ends. Without it the only
+  // thing watching is a poll loop inside an edge worker, and a worker recycled
+  // mid-job leaves the asset in 'processing' until the output is purged.
+  const res = await fetch(`https://api.replicate.com/v1/models/${apiModel}/predictions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      input,
+      webhook: `${SUPABASE_URL}/functions/v1/replicate-webhook`,
+      webhook_events_filter: ['completed'],
+    }),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    console.error('[mcp:upscale] Replicate rejected the prediction:', res.status, text.slice(0, 500));
+    throw new Error('Bad request: upscale submission failed');
+  }
+  let data: { id?: string };
+  try { data = JSON.parse(text); } catch { data = {}; }
+  if (!data.id) throw new Error('Bad request: upscale submission returned no prediction id');
+  return data.id;
+}
+
+// Hands the job to the shared poller, which writes the finished file back onto
+// the asset row — the same path the app's upscales take.
+function startPolling(assetId: string, taskId: string) {
+  service.functions
+    .invoke('check-generation-status', { body: { assetId, taskId, provider: 'replicate' } })
+    .catch(() => {});
+}
+
+// Replicate refused the job after we charged for it: give the tokens back and
+// mark the row failed, so nothing is left hanging in processing.
+async function unwindUpscale(
+  assetId: string,
+  ctx: UserCtx,
+  tokenCost: number,
+  label: string,
+  message: string,
+  metadata: Record<string, unknown>,
+) {
+  try {
+    await service
+      .from('assets')
+      .update({
+        status: 'failed',
+        completed_at: new Date().toISOString(),
+        metadata: { ...metadata, error: message, error_title: 'Upscale could not be started' },
+      })
+      .eq('id', assetId);
+  } catch (_) { /* the refund matters more than the status */ }
+  const refund = await refundTokens(service, ctx.userId, ctx.workspaceId, tokenCost, assetId, `Refund: ${label}`);
+  if (!refund.success) console.error(`[mcp:upscale] refund failed for asset ${assetId}:`, refund.error);
+}
+
+mcp.tool('upscale_video', {
+  description:
+    'Upscale a video with Topaz (720p/1080p/4k, 25/30/50/60 fps). Pass a public https video_url, or a source_asset_id to upscale one of your own videos. Billing is per 5 seconds of source, so an external URL needs duration_seconds. Returns asset_id immediately; poll with wait_for_asset (the job usually outlives one call).',
+  inputSchema: z.object({
+    video_url: z.string().optional(),
+    source_asset_id: z.string().optional(),
+    model: z.string().optional(),
+    duration_seconds: z.number().optional(),
+    parameters: z.record(z.unknown()).optional(),
+  }),
+  handler: withAudit('upscale_video', async (args: any, ctx) => {
+    const m = requireUpscaleModel(String(args?.model ?? 'topaz-video-upscaler').trim(), 'video');
+    const params = validateParameters(m, args?.parameters);
+
+    const resolution = String(params.targetResolution ?? '1080p');
+    const fps = Number(params.targetFps ?? 30);
+    if (!['720p', '1080p', '4k'].includes(resolution)) {
+      throw new Error('Invalid targetResolution: expected 720p, 1080p or 4k');
+    }
+    if (![25, 30, 50, 60].includes(fps)) {
+      throw new Error('Invalid targetFps: expected 25, 30, 50 or 60');
+    }
+
+    // Source: either one of the caller's assets (trusted url and duration) or an
+    // external public https url with a declared duration.
+    const sourceAssetId = args?.source_asset_id ? String(args.source_asset_id) : null;
+    const source = sourceAssetId
+      ? await ownedAsset(sourceAssetId, ctx, ['video', 'upscale_video'])
+      : null;
+    const videoUrl = String(args?.video_url ?? source?.file_url ?? '').trim();
+    if (!videoUrl) throw new Error('Bad request: video_url or source_asset_id required');
+    assertPublicHttpsUrl(videoUrl, 'video_url');
+
+    const { seconds, source: durationSource } = resolveUpscaleDuration(
+      args?.duration_seconds,
+      (source?.metadata as Record<string, unknown> | null)?.duration,
+    );
+
+    const apiCost = variantApiCost(m, { resolution, fps }) * (seconds / 5);
+    const marginPercent = await upscaleMarginPercent();
+    const tokenCost = tokensFor(apiCost, marginPercent);
+
+    const label = `Video upscale ${resolution}@${fps}fps`;
+    const deduction = await deductTokens(service, ctx.userId, ctx.workspaceId, tokenCost, label);
+    if (!deduction.success) {
+      throw new Error(
+        `Invalid request: insufficient tokens — ${tokenCost} required, ${deduction.available ?? deduction.newBalance} available`,
+      );
+    }
+
+    const basePrompt = source ? (source.original_prompt || source.prompt) : null;
+    const prompt = basePrompt ? `Upscale ${resolution}@${fps}fps - ${basePrompt}` : label;
+    const metadata = {
+      target_resolution: resolution,
+      target_fps: fps,
+      duration: seconds,
+      duration_source: durationSource,
+      source_asset_id: sourceAssetId,
+      via: 'mcp',
+    };
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    const { data: asset, error: assetError } = await service
+      .from('assets')
+      .insert({
+        user_id: ctx.userId,
+        workspace_id: ctx.workspaceId,
+        type: 'upscale_video',
+        status: 'processing',
+        prompt,
+        original_prompt: prompt,
+        model: m.id,
+        provider: m.provider,
+        tokens_cost: tokenCost,
+        api_cost_eur: apiCost,
+        source_asset_id: sourceAssetId,
+        expires_at: expiresAt,
+        in_gallery: false,
+        metadata,
+      })
+      .select('id')
+      .single();
+
+    if (assetError || !asset?.id) {
+      await refundTokens(service, ctx.userId, ctx.workspaceId, tokenCost, null, `Refund: ${label}`);
+      console.error('[mcp:upscale_video] asset insert failed:', assetError?.message);
+      throw new Error('Bad request: could not create the upscale job');
+    }
+
+    let taskId: string;
+    try {
+      taskId = await submitReplicate(m.apiModel ?? 'topazlabs/video-upscale', {
+        video: videoUrl,
+        target_resolution: resolution,
+        target_fps: fps,
+      });
+    } catch (e) {
+      await unwindUpscale(asset.id, ctx, tokenCost, label, (e as Error).message, metadata);
+      throw e;
+    }
+
+    await service.from('assets').update({ task_id: taskId }).eq('id', asset.id);
+    startPolling(asset.id, taskId);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              asset_id: asset.id,
+              status: 'processing',
+              model: m.id,
+              target_resolution: resolution,
+              target_fps: fps,
+              billed_duration_seconds: seconds,
+              duration_source: durationSource,
+              tokens_cost: tokenCost,
+              api_cost_eur: Number(apiCost.toFixed(4)),
+              margin_percent: marginPercent,
+              new_balance: deduction.newBalance,
+              expires_at: expiresAt,
+              message:
+                'Upscale started. Poll with wait_for_asset (max 120s per call) · a 4k job can take several minutes. The result expires in 7 days.',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }),
+});
+
+mcp.tool('upscale_image', {
+  description:
+    'Upscale an image with Topaz (x2 or x4, face enhancement on). Pass a public https image_url, or a source_asset_id to upscale one of your own images. Returns asset_id immediately; poll with wait_for_asset.',
+  inputSchema: z.object({
+    image_url: z.string().optional(),
+    source_asset_id: z.string().optional(),
+    model: z.string().optional(),
+    upscale_factor: z.enum(['x2', 'x4']).optional(),
+    output_format: z.enum(['png', 'jpg']).optional(),
+    parameters: z.record(z.unknown()).optional(),
+  }),
+  handler: withAudit('upscale_image', async (args: any, ctx) => {
+    const m = requireUpscaleModel(String(args?.model ?? 'topaz-upscaler').trim(), 'image');
+    const params = validateParameters(m, args?.parameters);
+
+    const factor = String(args?.upscale_factor ?? 'x2');
+    if (!['x2', 'x4'].includes(factor)) throw new Error('Invalid upscale_factor: expected x2 or x4');
+    const format = args?.output_format === 'jpg' ? 'jpg' : 'png';
+    const enhanceModel = String(params.enhanceModel ?? 'Standard V2');
+
+    const sourceAssetId = args?.source_asset_id ? String(args.source_asset_id) : null;
+    const source = sourceAssetId
+      ? await ownedAsset(sourceAssetId, ctx, ['image', 'upscale_image'])
+      : null;
+    const imageUrl = String(args?.image_url ?? source?.file_url ?? '').trim();
+    if (!imageUrl) throw new Error('Bad request: image_url or source_asset_id required');
+    assertPublicHttpsUrl(imageUrl, 'image_url');
+
+    // Fixed price per image; x4 is the double pass the app also charges double for.
+    const apiCost = variantApiCost(m, {}) * (factor === 'x4' ? 2 : 1);
+    const marginPercent = await upscaleMarginPercent();
+    const tokenCost = tokensFor(apiCost, marginPercent);
+
+    const label = `Image upscale ${factor}`;
+    const deduction = await deductTokens(service, ctx.userId, ctx.workspaceId, tokenCost, label);
+    if (!deduction.success) {
+      throw new Error(
+        `Invalid request: insufficient tokens — ${tokenCost} required, ${deduction.available ?? deduction.newBalance} available`,
+      );
+    }
+
+    const basePrompt = source ? (source.original_prompt || source.prompt) : null;
+    const prompt = basePrompt ? `Upscale ${factor} - ${basePrompt}` : label;
+    const metadata = {
+      upscale_factor: factor,
+      enhance_model: enhanceModel,
+      format,
+      source_asset_id: sourceAssetId,
+      via: 'mcp',
+    };
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    const { data: asset, error: assetError } = await service
+      .from('assets')
+      .insert({
+        user_id: ctx.userId,
+        workspace_id: ctx.workspaceId,
+        type: 'upscale_image',
+        status: 'processing',
+        prompt,
+        original_prompt: prompt,
+        model: m.id,
+        provider: m.provider,
+        tokens_cost: tokenCost,
+        api_cost_eur: apiCost,
+        source_asset_id: sourceAssetId,
+        expires_at: expiresAt,
+        in_gallery: false,
+        metadata,
+      })
+      .select('id')
+      .single();
+
+    if (assetError || !asset?.id) {
+      await refundTokens(service, ctx.userId, ctx.workspaceId, tokenCost, null, `Refund: ${label}`);
+      console.error('[mcp:upscale_image] asset insert failed:', assetError?.message);
+      throw new Error('Bad request: could not create the upscale job');
+    }
+
+    let taskId: string;
+    try {
+      taskId = await submitReplicate(m.apiModel ?? 'topazlabs/image-upscale', {
+        image: imageUrl,
+        enhance_model: enhanceModel,
+        upscale_factor: factor === 'x2' ? '2x' : '4x',
+        output_format: format,
+        face_enhancement: true,
+        face_enhancement_creativity: 0.5,
+        face_enhancement_strength: 0.8,
+        subject_detection: 'None',
+      });
+    } catch (e) {
+      await unwindUpscale(asset.id, ctx, tokenCost, label, (e as Error).message, metadata);
+      throw e;
+    }
+
+    await service.from('assets').update({ task_id: taskId }).eq('id', asset.id);
+    startPolling(asset.id, taskId);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              asset_id: asset.id,
+              status: 'processing',
+              model: m.id,
+              upscale_factor: factor,
+              enhance_model: enhanceModel,
+              output_format: format,
+              tokens_cost: tokenCost,
+              api_cost_eur: Number(apiCost.toFixed(4)),
+              margin_percent: marginPercent,
+              new_balance: deduction.newBalance,
+              expires_at: expiresAt,
+              message:
+                'Upscale started. Poll with wait_for_asset, or get_asset with include_image=true once it completes. The result expires in 7 days.',
             },
             null,
             2,
