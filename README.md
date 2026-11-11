@@ -8,7 +8,7 @@ Un dossier par MCP.
 | [`after-effects/`](after-effects) | `AfterEffectsMCP` | stdio (node local) | oui, integrale |
 | [`ab-arts-studio/`](ab-arts-studio) | `ab-arts-studio` | http (Supabase Edge Function) | oui, `index.ts` + `deno.json` |
 | [`higgsfield/`](higgsfield) | `higgsfield` | http (heberge par Higgsfield) + CLI npm | non, rien a sauvegarder |
-| [`davinci-resolve/`](davinci-resolve) | `davinci-resolve` | stdio (python local, sans dependance) | oui, integrale (`server.py`) |
+| [`davinci-resolve/`](davinci-resolve) | `davinci-resolve` | stdio (`ResolveMCP.exe` officiel, livre avec Resolve Studio 21.2) | non, livre avec Resolve (recette Text+ dans le README) |
 
 `node_modules/` n'est jamais sauvegarde : un `npm install` le reconstruit depuis
 le `package-lock.json` present dans chaque dossier.
@@ -23,8 +23,8 @@ cd claude-mcp/after-effects
 npm install
 ```
 
-Pour `davinci-resolve/`, rien a installer : copier `server.py` et le declarer
-(voir le README du dossier). Il exige DaVinci Resolve **Studio** ouvert.
+Pour `davinci-resolve/`, rien a installer : le serveur officiel est livre avec
+DaVinci Resolve **Studio** 21.2 (voir le README du dossier pour la declaration).
 
 Pour le serveur **http** (`ab-arts-studio/`), il n'y a rien a installer en
 local : il se redeploie cote Supabase.
